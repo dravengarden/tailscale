@@ -8,9 +8,13 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"net/netip"
+	"net/url"
 	"time"
 
+	"github.com/sagernet/tailscale/feature"
+	"github.com/sagernet/tailscale/feature/buildfeatures"
 	"github.com/sagernet/tailscale/net/sockstats"
 	tailcfg "github.com/sagernet/tailscale/tailcfg"
 )
@@ -47,6 +51,32 @@ func (c *Client) dialNodeTLS(ctx context.Context, n *tailcfg.DERPNode) (*tls.Con
 	ctx, cancel := context.WithTimeout(ctx, dialNodeTimeout)
 	defer cancel()
 
+	// Netcheck must honor the same proxy boundary as ordinary DERP dials.
+	// The native IPv4/IPv6 race below deliberately bypasses netMon's dialer;
+	// it is appropriate only when proxy resolution explicitly selects direct.
+	if buildfeatures.HasUseProxy {
+		if proxyFromEnv, ok := feature.HookProxyFromEnvironment.GetOk(); ok {
+			proxyURL, err := proxyFromEnv(&http.Request{URL: &url.URL{
+				Scheme: "https", Host: c.tlsServerName(n), Path: "/",
+			}})
+			if err != nil {
+				return nil, err
+			}
+			if proxyURL != nil {
+				conn, err := c.dialNodeUsingProxy(ctx, n, proxyURL)
+				if err != nil {
+					return nil, err
+				}
+				tlsConn := c.tlsClient(conn, n)
+				if err := tlsConn.HandshakeContext(ctx); err != nil {
+					conn.Close()
+					return nil, err
+				}
+				return tlsConn, nil
+			}
+		}
+	}
+
 	ctx = sockstats.WithSockStats(ctx, sockstats.LabelDERPHTTPClient, c.logf)
 
 	nwait := 0
@@ -82,13 +112,14 @@ func (c *Client) dialNodeTLS(ctx context.Context, n *tailcfg.DERPNode) (*tls.Con
 				return
 			}
 			tlsConn := c.tlsClient(conn, n)
-			err = tlsConn.Handshake()
+			err = tlsConn.HandshakeContext(ctx)
+			if err != nil {
+				tlsConn.Close()
+			}
 			select {
 			case resc <- res{tlsConn, err}:
 			case <-ctx.Done():
-				if c != nil {
-					c.Close()
-				}
+				tlsConn.Close()
 			}
 		}()
 	}
