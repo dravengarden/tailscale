@@ -11,6 +11,16 @@ implementation calls `NewDialerAlwaysDirect` before consulting that hook.
 It also bounds the TLS handshake by the caller context and closes failed or
 losing race connections instead of closing the unrelated DERP client.
 
+The magicsock patch retains loopback-backed DERP connections for the existing
+bounded health ping during UDP rebinding. Comparing a local CONNECT hop with
+physical-interface addresses previously closed a healthy relay as a supposed
+default-route change. This matters when approved LAN prefixes keep native UDP
+discovery enabled. Non-loopback addresses still follow interface-change
+reconnection; unhealthy loopback-backed relays still reconnect after ping
+failure. Native discovery, transport authorization and fail-closed policy are
+unchanged. Remove this patch when equivalent upstream behavior passes both
+the address-class regression and Stormbird's explicit-rebind transport gate.
+
 There are no fleet identities, relay lists, proxy credentials, or routing
 policies here. Those remain Stormbird-owned runtime configuration. Remove the
 replacement when an upstream release includes equivalent behavior and passes

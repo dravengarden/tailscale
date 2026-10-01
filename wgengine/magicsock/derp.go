@@ -912,7 +912,7 @@ func (c *Conn) maybeCloseDERPsOnRebind(okayLocalIPs []netip.Prefix) {
 			c.closeOrReconnectDERPLocked(regionID, "rebind-no-localaddr")
 			continue
 		}
-		if !tsaddr.PrefixesContainsIP(okayLocalIPs, la.Addr()) {
+		if !derpLocalAddrOnCurrentNetwork(la.Addr(), okayLocalIPs) {
 			c.closeOrReconnectDERPLocked(regionID, "rebind-default-route-change")
 			continue
 		}
@@ -930,6 +930,15 @@ func (c *Conn) maybeCloseDERPsOnRebind(okayLocalIPs []netip.Prefix) {
 		}()
 	}
 	c.logActiveDerpLocked()
+}
+
+func derpLocalAddrOnCurrentNetwork(local netip.Addr, interfaces []netip.Prefix) bool {
+	// A loopback local address belongs to a local proxy (or local DERP), not
+	// the physical interface carrying its upstream connection. Keep the
+	// existing DERP health ping as the liveness check rather than closing a
+	// healthy connection on every UDP rebind. Non-loopback sockets still
+	// reconnect when their actual interface address is no longer present.
+	return local.IsLoopback() || tsaddr.PrefixesContainsIP(interfaces, local)
 }
 
 // closeOrReconnectDERPLocked closes the DERP connection to the
