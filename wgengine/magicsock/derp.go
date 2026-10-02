@@ -359,7 +359,7 @@ func (c *Conn) derpWriteChanForRegion(regionID int, peer key.NodePublic) chan de
 	if !c.wantDerpLocked() || c.closed {
 		return nil
 	}
-	if c.derpMap == nil || c.derpMap.Regions[regionID] == nil {
+	if c.derpMap == nil {
 		return nil
 	}
 	if c.privateKey.IsZero() {
@@ -372,7 +372,7 @@ func (c *Conn) derpWriteChanForRegion(regionID int, peer key.NodePublic) chan de
 	// arbitrary whether we use this one vs. the reverse route
 	// below when we have both.)
 	ad, ok := c.activeDerp[regionID]
-	if ok {
+	if ok && c.derpMap.Regions[regionID] != nil {
 		*ad.lastWrite = time.Now()
 		c.setPeerLastDerpLocked(peer, regionID, regionID)
 		return ad.writeCh
@@ -386,12 +386,15 @@ func (c *Conn) derpWriteChanForRegion(regionID int, peer key.NodePublic) chan de
 	// SF connection rather than dialing Frankfurt. (Issue 150)
 	if !peer.IsZero() {
 		if r, ok := c.derpRoute[peer]; ok {
-			if ad, ok := c.activeDerp[r.regionID]; ok && ad.c == r.dc && c.permitsPeerDERP(peer, r.regionID) {
+			if ad, ok := c.activeDerp[r.regionID]; ok && ad.c == r.dc && c.derpMap.Regions[r.regionID] != nil && c.permitsPeerDERP(peer, r.regionID) {
 				c.setPeerLastDerpLocked(peer, r.regionID, regionID)
 				*ad.lastWrite = time.Now()
 				return ad.writeCh
 			}
 		}
+	}
+	if c.derpMap.Regions[regionID] == nil {
+		return nil
 	}
 
 	why := "home-keep-alive"
