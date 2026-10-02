@@ -21,9 +21,11 @@ func init() {
 }
 
 func dialWebsocket(ctx context.Context, urlStr string) (net.Conn, error) {
-	c, res, err := websocket.Dial(ctx, urlStr, &websocket.DialOptions{
-		Subprotocols: []string{"derp"},
-	})
+	options, err := policyWebsocketOptions()
+	if err != nil {
+		return nil, err
+	}
+	c, res, err := websocket.Dial(ctx, urlStr, options)
 	if err != nil {
 		log.Printf("websocket Dial: %v, %+v", err, res)
 		return nil, err

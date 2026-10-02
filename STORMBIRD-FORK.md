@@ -28,6 +28,13 @@ the consumer's negative socket and approved-proxy regressions.
 
 Validation from the pinned Stormbird development shell:
 
+The optional `derphttp.HookDialPolicy` authorizes DERP independently of control
+HTTPS before region data dials, netcheck, explicit URLs, and native WebSocket
+requests or redirects. The consumer supplies all authorities. Native WebSockets
+also retain the managed proxy boundary. Browsers cannot enforce redirected
+socket policy and fail closed when this optional hook is installed; ordinary
+clients without a hook retain upstream behavior and default HTTP client settings.
+
 ```sh
 go test -race ./derp/derphttp ./net/netcheck ./wgengine/magicsock
 go vet ./derp/derphttp
