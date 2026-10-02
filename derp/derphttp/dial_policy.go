@@ -6,6 +6,7 @@ import (
 	"strconv"
 
 	"github.com/sagernet/tailscale/feature"
+	"github.com/sagernet/tailscale/tailcfg"
 )
 
 // HookDialPolicy optionally authorizes a DERP authority before any socket is
@@ -13,6 +14,11 @@ import (
 // even when both services use the same hostname and port. The embedding runtime
 // owns the policy; an absent hook preserves upstream behavior.
 var HookDialPolicy feature.Hook[func(hostname string, port int) error]
+
+// HookMapPolicy optionally restricts the data relay map before netcheck and
+// home selection. The callback must not mutate the supplied map. Dial policy
+// remains necessary for explicit URLs and redirects outside the map.
+var HookMapPolicy feature.Hook[func(*tailcfg.DERPMap) *tailcfg.DERPMap]
 
 func checkDialPolicy(hostname string, port int) error {
 	if policy, ok := HookDialPolicy.GetOk(); ok {

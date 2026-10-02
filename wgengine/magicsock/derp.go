@@ -134,7 +134,7 @@ func (c *Conn) pickDERPFallback() int {
 	// We used to do the above for legacy clients, but never updated
 	// it for disco.
 
-	if c.myDerp != 0 {
+	if c.myDerp != 0 && c.derpMap.Regions[c.myDerp] != nil {
 		return c.myDerp
 	}
 
@@ -194,6 +194,11 @@ func (c *Conn) maybeSetNearestDERP(report *netcheck.Report, force bool) (preferr
 	}
 
 	preferredDERP = report.PreferredDERP
+	c.mu.Lock()
+	if c.derpMap == nil || c.derpMap.Regions[preferredDERP] == nil {
+		preferredDERP = 0
+	}
+	c.mu.Unlock()
 	if preferredDERP == 0 {
 		// Perhaps UDP is blocked. Pick a deterministic but arbitrary
 		// one.
@@ -836,6 +841,14 @@ func (c *Conn) setDERPMap(dm *tailcfg.DERPMap, doReStun bool) {
 		}
 	}
 
+	if policy, ok := derphttp.HookMapPolicy.GetOk(); ok {
+		dm = policy(dm)
+	}
+	if dm == nil || dm.Regions[c.myDerp] == nil {
+		// A cached home must not survive removal by an authority policy,
+		// including the first map installed after a cold start.
+		c.myDerp = 0
+	}
 	if reflect.DeepEqual(dm, c.derpMap) {
 		return
 	}
