@@ -35,6 +35,13 @@ also retain the managed proxy boundary. Browsers cannot enforce redirected
 socket policy and fail closed when this optional hook is installed; ordinary
 clients without a hook retain upstream behavior and default HTTP client settings.
 
+The optional `derphttp.HookMapPolicy` filters a data relay map before magicsock
+netcheck and home selection, without mutating the control client's cached map.
+Cached and reported homes absent from the active map cannot become fallback
+homes. This closes the authority-only gap where a denied control-only DERP
+could still be advertised as the client's home. The consumer owns node/port
+approval, including mixed regions; this fork contains no fleet topology.
+
 ```sh
 go test -race ./derp/derphttp ./net/netcheck ./wgengine/magicsock
 go vet ./derp/derphttp
