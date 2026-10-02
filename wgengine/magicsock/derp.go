@@ -204,6 +204,14 @@ func (c *Conn) maybeSetNearestDERP(report *netcheck.Report, force bool) (preferr
 		// one.
 		preferredDERP = c.pickDERPFallback()
 	}
+	if home := HookHomeDERPRegion.Load(); home != nil {
+		preferredDERP = home()
+		c.mu.Lock()
+		if c.derpMap == nil || c.derpMap.Regions[preferredDERP] == nil {
+			preferredDERP = 0
+		}
+		c.mu.Unlock()
+	}
 	if preferredDERP != myDerp {
 		c.logf(
 			"magicsock: home DERP changing from derp-%d [%dms] to derp-%d [%dms] (forced=%t)",
@@ -295,7 +303,7 @@ func (c *Conn) setNearestDERP(derpNum int) (wantDERP bool) {
 	for i, ad := range c.activeDerp {
 		go ad.c.NotePreferred(i == c.myDerp)
 	}
-	c.goDerpConnect(derpNum)
+	c.startDerpHomeConnectLocked()
 	return true
 }
 
@@ -304,6 +312,7 @@ func (c *Conn) setNearestDERP(derpNum int) (wantDERP bool) {
 // c.mu must be held.
 func (c *Conn) startDerpHomeConnectLocked() {
 	c.goDerpConnect(c.myDerp)
+	c.ensurePeerPolicyDERPs()
 }
 
 // goDerpConnect starts a goroutine to start connecting to the given
@@ -377,7 +386,7 @@ func (c *Conn) derpWriteChanForRegion(regionID int, peer key.NodePublic) chan de
 	// SF connection rather than dialing Frankfurt. (Issue 150)
 	if !peer.IsZero() {
 		if r, ok := c.derpRoute[peer]; ok {
-			if ad, ok := c.activeDerp[r.regionID]; ok && ad.c == r.dc {
+			if ad, ok := c.activeDerp[r.regionID]; ok && ad.c == r.dc && c.permitsPeerDERP(peer, r.regionID) {
 				c.setPeerLastDerpLocked(peer, r.regionID, regionID)
 				*ad.lastWrite = time.Now()
 				return ad.writeCh
@@ -465,7 +474,7 @@ func (c *Conn) derpWriteChanForRegion(regionID int, peer key.NodePublic) chan de
 	}
 
 	go c.runDerpReader(ctx, regionID, dc, wg, startGate)
-	go c.runDerpWriter(ctx, dc, ch, wg, startGate)
+	go c.runDerpWriter(ctx, dc, regionID, ch, wg, startGate)
 	go func() {
 		select {
 		case <-ctx.Done():
@@ -615,6 +624,10 @@ func (c *Conn) runDerpReader(ctx context.Context, regionID int, dc *derphttp.Cli
 			c.logf("magicsock: derp-%d connected; connGen=%v", regionID, connGen)
 			continue
 		case derp.ReceivedPacket:
+			if !c.permitsPeerDERP(m.Source, regionID) {
+				c.observePeerTransport(m.Source, "derp", regionID, "blocked_receive", len(m.Data))
+				continue
+			}
 			pkt = m
 			res.n = len(m.Data)
 			res.src = m.Source
@@ -684,7 +697,7 @@ type derpWriteRequest struct {
 
 // runDerpWriter runs in a goroutine for the life of a DERP
 // connection, handling received packets.
-func (c *Conn) runDerpWriter(ctx context.Context, dc *derphttp.Client, ch <-chan derpWriteRequest, wg *syncs.WaitGroupChan, startGate <-chan struct{}) {
+func (c *Conn) runDerpWriter(ctx context.Context, dc *derphttp.Client, regionID int, ch <-chan derpWriteRequest, wg *syncs.WaitGroupChan, startGate <-chan struct{}) {
 	defer wg.Decr()
 	select {
 	case <-startGate:
@@ -697,7 +710,14 @@ func (c *Conn) runDerpWriter(ctx context.Context, dc *derphttp.Client, ch <-chan
 		case <-ctx.Done():
 			return
 		case wr := <-ch:
+			if !c.permitsPeerDERP(wr.pubKey, regionID) {
+				c.observePeerTransport(wr.pubKey, "derp", regionID, "blocked_send", len(wr.b))
+				continue
+			}
 			err := dc.Send(wr.pubKey, wr.b)
+			if err == nil {
+				c.observePeerTransport(wr.pubKey, "derp", regionID, "sent", len(wr.b))
+			}
 			if err != nil {
 				c.logf("magicsock: derp.Send(%v): %v", wr.addr, err)
 				metricSendDERPError.Add(1)
@@ -729,6 +749,9 @@ func (c *connBind) receiveDERP(buffs [][]byte, sizes []int, eps []conn.Endpoint)
 		}
 		sizes[0] = n
 		eps[0] = ep
+		if HookPeerTransportPolicy.Load() != nil {
+			eps[0] = &transportAuthorizedEndpoint{endpoint: ep, region: dm.regionID, packetBytes: n}
+		}
 		return 1, nil
 	}
 	return 0, net.ErrClosed
@@ -860,6 +883,7 @@ func (c *Conn) setDERPMap(dm *tailcfg.DERPMap, doReStun bool) {
 		c.closeAllDerpLocked("derp-disabled")
 		return
 	}
+	c.ensurePeerPolicyDERPs()
 
 	// Reconnect any DERP region that changed definitions.
 	if old != nil {
@@ -963,8 +987,8 @@ func derpLocalAddrOnCurrentNetwork(local netip.Addr, interfaces []netip.Prefix) 
 // c.mu must be held.
 func (c *Conn) closeOrReconnectDERPLocked(regionID int, why string) {
 	c.closeDerpLocked(regionID, why)
-	if !c.privateKey.IsZero() && c.myDerp == regionID {
-		c.startDerpHomeConnectLocked()
+	if !c.privateKey.IsZero() && (c.myDerp == regionID || c.requiredPeerDERPs()[regionID]) {
+		c.goDerpConnect(regionID)
 	}
 }
 
@@ -1016,10 +1040,15 @@ func (c *Conn) cleanStaleDerp() {
 	c.derpCleanupTimerArmed = false
 
 	tooOld := time.Now().Add(-derpInactiveCleanupTime)
+	required := c.requiredPeerDERPs()
 	dirty := false
 	someNonHomeOpen := false
 	for i, ad := range c.activeDerp {
 		if i == c.myDerp {
+			continue
+		}
+		if required[i] {
+			someNonHomeOpen = true
 			continue
 		}
 		if ad.lastWrite.Before(tooOld) {
