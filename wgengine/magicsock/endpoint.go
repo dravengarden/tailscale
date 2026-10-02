@@ -903,6 +903,9 @@ func (de *endpoint) discoverUDPRelayPathsLocked(now mono.Time) {
 // wantUDPRelayPathDiscoveryLocked reports whether we should kick off UDP relay
 // path discovery.
 func (de *endpoint) wantUDPRelayPathDiscoveryLocked(now mono.Time) bool {
+	if HookPeerTransportPolicy.Load() != nil {
+		return false
+	}
 	if runtime.GOOS == "js" {
 		return false
 	}
@@ -1005,6 +1008,14 @@ func (de *endpoint) discoPing(res *ipnstate.PingResult, size int, cb func(*ipnst
 
 	now := mono.Now()
 	udpAddr, derpAddr := de.addrForPingSizeLocked(now, size)
+	if !de.c.permitsNativePeer(de.publicKey, udpAddr.vni.IsSet()) {
+		udpAddr = epAddr{}
+	}
+	if _, scoped := de.c.transportPolicy(de.publicKey); scoped && !derpAddr.IsValid() && !udpAddr.ap.IsValid() {
+		if region, permitted := de.c.selectPeerDERP(de.publicKey, 0); permitted {
+			derpAddr = peerDERPAddress(region)
+		}
+	}
 
 	if derpAddr.IsValid() {
 		de.startDiscoPingLocked(epAddr{ap: derpAddr}, now, pingCLI, size, resCB)
@@ -1058,6 +1069,15 @@ func (de *endpoint) send(buffs [][]byte, offset int) error {
 
 	now := mono.Now()
 	udpAddr, derpAddr, startWGPing := de.addrForSendLocked(now)
+	if !de.c.permitsNativePeer(de.publicKey, udpAddr.vni.IsSet()) {
+		udpAddr = epAddr{}
+		startWGPing = false
+	}
+	if _, scoped := de.c.transportPolicy(de.publicKey); scoped && !udpAddr.ap.IsValid() && !derpAddr.IsValid() {
+		if region, ok := de.c.selectPeerDERP(de.publicKey, 0); ok {
+			derpAddr = peerDERPAddress(region)
+		}
+	}
 
 	if de.isWireguardOnly {
 		if startWGPing {
@@ -1087,6 +1107,11 @@ func (de *endpoint) send(buffs [][]byte, offset int) error {
 	var err error
 	if udpAddr.ap.IsValid() {
 		_, err = de.c.sendUDPBatch(udpAddr, buffs, offset)
+		if err == nil {
+			for _, b := range buffs {
+				de.c.observePeerTransport(de.publicKey, "native_udp", 0, "sent", len(b)-offset)
+			}
+		}
 
 		// If the error is known to indicate that the endpoint is no longer
 		// usable, clear the endpoint statistics so that the next send will
@@ -1300,6 +1325,15 @@ func (de *endpoint) startDiscoPingLocked(ep epAddr, now mono.Time, purpose disco
 	if runtime.GOOS == "js" {
 		return
 	}
+	if ep.ap.Addr() == tailcfg.DerpMagicIPAddr {
+		region, permitted := de.c.selectPeerDERP(de.publicKey, int(ep.ap.Port()))
+		if !permitted {
+			return
+		}
+		ep.ap = peerDERPAddress(region)
+	} else if !de.c.permitsNativePeer(de.publicKey, ep.vni.IsSet()) {
+		return
+	}
 	if debugNeverDirectUDP() && !ep.vni.IsSet() && ep.ap.Addr() != tailcfg.DerpMagicIPAddr {
 		return
 	}
@@ -1368,6 +1402,12 @@ func (de *endpoint) sendDiscoPingsLocked(now mono.Time, sendCallMeMaybe bool) {
 		return // skip when direct UDP is disabled
 	}
 	de.lastFullPing = now
+	if !de.c.permitsNativePeer(de.publicKey, false) {
+		// Do not mark prohibited endpoints as sent or enqueue CallMeMaybe.
+		// Otherwise every data batch can trigger fresh discovery work because
+		// startDiscoPingLocked correctly leaves their lastPing unchanged.
+		return
+	}
 	var sentAny bool
 	for ep, st := range de.endpointState {
 		if st.shouldDeleteLocked() {
@@ -1486,11 +1526,13 @@ func (de *endpoint) setLastPing(ipp netip.AddrPort, now mono.Time) {
 func (de *endpoint) updateDiscoKey(key key.DiscoPublic) {
 	if key.IsZero() {
 		de.disco.Store(nil)
+		de.c.transportDiscoKeys.Delete(de.publicKey)
 	} else {
 		de.disco.Store(&endpointDisco{
 			key:   key,
 			short: key.ShortString(),
 		})
+		de.c.transportDiscoKeys.Store(de.publicKey, key)
 	}
 }
 

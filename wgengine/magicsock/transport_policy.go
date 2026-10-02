@@ -1,0 +1,130 @@
+package magicsock
+
+import (
+	"net/netip"
+	"slices"
+
+	"github.com/sagernet/tailscale/syncs"
+	"github.com/sagernet/tailscale/tailcfg"
+	"github.com/sagernet/tailscale/types/key"
+)
+
+// PeerTransportPolicy is an optional embedding boundary. NativeUDP includes
+// discovery, not just WireGuard data. DERPRegions confines both discovery and
+// data to the same region set; it also constrains reverse-route reuse.
+type PeerTransportPolicy struct {
+	NativeUDP   bool
+	DERPRegions []int
+}
+
+// HookPeerTransportPolicy returns the embedding application's explicit policy
+// for a control-authenticated stable node identity. An empty policy denies all
+// paths. With no hook installed, upstream behavior is unchanged.
+// Scoped mode supports Tailscale discovery peers only. WireGuard-only peers
+// cannot establish a control-authenticated discovery identity after roaming
+// and are denied rather than admitting unknown UDP or emitting cookie replies.
+// The callback must be bounded and must not call back into Conn.
+var HookPeerTransportPolicy syncs.AtomicValue[func(tailcfg.StableNodeID) PeerTransportPolicy]
+
+// HookHomeDERPRegion confines the advertised receive rendezvous without
+// removing regions needed by other scoped peers from the shared DERP map.
+var HookHomeDERPRegion syncs.AtomicValue[func() int]
+
+// HookPeerTransportObservation is local, bounded telemetry. It never carries
+// packet contents, keys, destinations, or credentials. "sent" means a socket
+// write succeeded, not that the remote application acknowledged the packet.
+var HookPeerTransportObservation syncs.AtomicValue[func(tailcfg.StableNodeID, string, int, string, int)]
+
+func (c *Conn) observePeerTransport(peer key.NodePublic, path string, region int, action string, bytes int) {
+	if hook := HookPeerTransportObservation.Load(); hook != nil {
+		if node, ok := c.transportPeers.Load(peer); ok {
+			hook(node.(tailcfg.NodeView).StableID(), path, region, action, bytes)
+		}
+	}
+}
+
+func (c *Conn) transportPolicy(peer key.NodePublic) (PeerTransportPolicy, bool) {
+	hook := HookPeerTransportPolicy.Load()
+	if hook == nil {
+		return PeerTransportPolicy{}, false
+	}
+	node, ok := c.transportPeers.Load(peer)
+	if !ok {
+		return PeerTransportPolicy{}, true
+	}
+	view := node.(tailcfg.NodeView)
+	if view.IsWireGuardOnly() {
+		return PeerTransportPolicy{}, true
+	}
+	return hook(view.StableID()), true
+}
+
+func (c *Conn) permitsNativePeer(peer key.NodePublic, peerRelay bool) bool {
+	p, scoped := c.transportPolicy(peer)
+	return !scoped || (!peerRelay && p.NativeUDP)
+}
+
+// selectPeerDERP never substitutes an unauthorized reverse route or region.
+// The first region is the deterministic rendezvous when the peer advertises
+// a home outside its approved set. Both scoped peers must share that region.
+func (c *Conn) selectPeerDERP(peer key.NodePublic, region int) (int, bool) {
+	p, scoped := c.transportPolicy(peer)
+	if !scoped {
+		return region, true
+	}
+	if slices.Contains(p.DERPRegions, region) {
+		return region, true
+	}
+	if len(p.DERPRegions) == 0 {
+		return 0, false
+	}
+	return p.DERPRegions[0], true
+}
+
+func (c *Conn) permitsPeerDERP(peer key.NodePublic, region int) bool {
+	p, scoped := c.transportPolicy(peer)
+	return !scoped || slices.Contains(p.DERPRegions, region)
+}
+
+// Discovery can identify peers by a disco key before their UDP endpoint is
+// known. Ambiguous disco keys are admitted only if every matching peer agrees.
+func (c *Conn) permitsNativeDisco(disco key.DiscoPublic, peerRelay bool) bool {
+	if HookPeerTransportPolicy.Load() == nil {
+		return true
+	}
+	found, allowed := false, true
+	c.transportPeers.Range(func(k, _ any) bool {
+		current, exists := c.transportDiscoKeys.Load(k)
+		if exists && current.(key.DiscoPublic) == disco {
+			found = true
+			allowed = allowed && c.permitsNativePeer(k.(key.NodePublic), peerRelay)
+		}
+		return allowed
+	})
+	return found && allowed
+}
+
+func peerDERPAddress(region int) netip.AddrPort {
+	return netip.AddrPortFrom(tailcfg.DerpMagicIPAddr, uint16(region))
+}
+
+func (c *Conn) requiredPeerDERPs() map[int]bool {
+	regions := make(map[int]bool)
+	if HookPeerTransportPolicy.Load() == nil {
+		return regions
+	}
+	c.transportPeers.Range(func(k, _ any) bool {
+		p, _ := c.transportPolicy(k.(key.NodePublic))
+		for _, region := range p.DERPRegions {
+			regions[region] = true
+		}
+		return true
+	})
+	return regions
+}
+
+func (c *Conn) ensurePeerPolicyDERPs() {
+	for region := range c.requiredPeerDERPs() {
+		c.goDerpConnect(region)
+	}
+}

@@ -107,3 +107,5 @@ require (
 	golang.org/x/text v0.40.0
 	google.golang.org/protobuf v1.36.11 // indirect
 )
+
+replace github.com/sagernet/wireguard-go => github.com/dravengarden/wireguard-go v0.0.0-20261002094445-20ebcb256963
