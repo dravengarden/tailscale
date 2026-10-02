@@ -404,6 +404,13 @@ func (c *Client) connect(ctx context.Context, caller string) (client *derp.Clien
 			urlStr = c.urlString(reg.Nodes[0])
 		}
 		c.logf("%s: connecting websocket to %v", caller, urlStr)
+		policyURL, err := url.Parse(urlStr)
+		if err != nil {
+			return nil, 0, err
+		}
+		if err := checkURLDialPolicy(policyURL); err != nil {
+			return nil, 0, err
+		}
 		conn, err := dialWebsocketFunc(ctx, urlStr)
 		if err != nil {
 			c.logf("%s: websocket to %v error: %v", caller, urlStr, err)
@@ -604,6 +611,9 @@ func (c *Client) SetURLDialer(dialer netx.DialFunc) {
 }
 
 func (c *Client) dialURL(ctx context.Context) (net.Conn, error) {
+	if err := checkURLDialPolicy(c.url); err != nil {
+		return nil, err
+	}
 	host := c.url.Hostname()
 	if c.dialer != nil {
 		return c.dialer(ctx, "tcp", net.JoinHostPort(host, urlPort(c.url)))
@@ -740,6 +750,14 @@ const dialNodeTimeout = 1500 * time.Millisecond
 // TODO(bradfitz): longer if no options remain perhaps? ...  Or longer
 // overall but have dialRegion start overlapping races?
 func (c *Client) dialNode(ctx context.Context, n *tailcfg.DERPNode) (net.Conn, error) {
+	defaultPort := 443
+	if !c.useHTTPS() {
+		defaultPort = 3340
+	}
+	port := cmp.Or(n.DERPPort, defaultPort)
+	if err := checkDialPolicy(n.HostName, port); err != nil {
+		return nil, err
+	}
 	// First see if we need to use an HTTP proxy.
 	proxyReq := &http.Request{
 		Method: "GET", // doesn't really matter

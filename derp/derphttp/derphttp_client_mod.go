@@ -43,6 +43,13 @@ func (c *Client) DialRegionTLS(ctx context.Context, reg *tailcfg.DERPRegion) (tl
 }
 
 func (c *Client) dialNodeTLS(ctx context.Context, n *tailcfg.DERPNode) (*tls.Conn, error) {
+	defaultPort := 443
+	if !c.useHTTPS() {
+		defaultPort = 3340
+	}
+	if err := checkDialPolicy(n.HostName, cmp.Or(n.DERPPort, defaultPort)); err != nil {
+		return nil, err
+	}
 	type res struct {
 		c   *tls.Conn
 		err error
