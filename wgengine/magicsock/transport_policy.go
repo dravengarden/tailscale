@@ -30,6 +30,14 @@ var HookPeerTransportPolicy syncs.AtomicValue[func(tailcfg.StableNodeID) PeerTra
 // removing regions needed by other scoped peers from the shared DERP map.
 var HookHomeDERPRegion syncs.AtomicValue[func() int]
 
+// HookFallbackDERPRegions is an optional legacy embedding boundary for a
+// deliberately filtered DERP map. A peer may advertise a home outside that
+// map. Retain the approved rendezvous connections and use the first approved
+// region in that case; never reopen the filtered authority. Both endpoints
+// must share a rendezvous. Explicit per-peer policy takes precedence.
+// This hook does not change native UDP or WireGuard peer authorization.
+var HookFallbackDERPRegions syncs.AtomicValue[func() []int]
+
 // HookPeerTransportObservation is local, bounded telemetry. It never carries
 // packet contents, keys, destinations, or credentials. "sent" means a socket
 // write succeeded, not that the remote application acknowledged the packet.
@@ -70,7 +78,11 @@ func (c *Conn) permitsNativePeer(peer key.NodePublic, peerRelay bool) bool {
 func (c *Conn) selectPeerDERP(peer key.NodePublic, region int) (int, bool) {
 	p, scoped := c.transportPolicy(peer)
 	if !scoped {
-		return region, true
+		if hook := HookFallbackDERPRegions.Load(); hook != nil {
+			p.DERPRegions = hook()
+		} else {
+			return region, true
+		}
 	}
 	if slices.Contains(p.DERPRegions, region) {
 		return region, true
@@ -83,6 +95,11 @@ func (c *Conn) selectPeerDERP(peer key.NodePublic, region int) (int, bool) {
 
 func (c *Conn) permitsPeerDERP(peer key.NodePublic, region int) bool {
 	p, scoped := c.transportPolicy(peer)
+	if !scoped {
+		if hook := HookFallbackDERPRegions.Load(); hook != nil {
+			return slices.Contains(hook(), region)
+		}
+	}
 	return !scoped || slices.Contains(p.DERPRegions, region)
 }
 
@@ -111,6 +128,11 @@ func peerDERPAddress(region int) netip.AddrPort {
 func (c *Conn) requiredPeerDERPs() map[int]bool {
 	regions := make(map[int]bool)
 	if HookPeerTransportPolicy.Load() == nil {
+		if hook := HookFallbackDERPRegions.Load(); hook != nil {
+			for _, region := range hook() {
+				regions[region] = true
+			}
+		}
 		return regions
 	}
 	c.transportPeers.Range(func(k, _ any) bool {

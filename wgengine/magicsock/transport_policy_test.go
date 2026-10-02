@@ -267,3 +267,59 @@ func TestScopedSendUsesPeerRendezvousNotSharedHome(t *testing.T) {
 		t.Fatal("cross-border native discovery sent")
 	}
 }
+
+func TestFilteredMapStillUsesApprovedReverseRoute(t *testing.T) {
+	peer := key.NewNode().Public()
+	queue := make(chan derpWriteRequest, 1)
+	now := time.Now()
+	c := &Conn{
+		privateKey:   key.NewNode(),
+		derpMap:      &tailcfg.DERPMap{Regions: map[int]*tailcfg.DERPRegion{17: {RegionID: 17}}},
+		activeDerp:   map[int]activeDerp{17: {writeCh: queue, lastWrite: &now}},
+		derpRoute:    map[key.NodePublic]derpRoute{peer: {regionID: 17}},
+		peerLastDerp: make(map[key.NodePublic]int),
+		logf:         t.Logf,
+	}
+	// The remote advertised home is outside the locally filtered map. Its
+	// authenticated reverse route is still approved and connected.
+	if got := c.derpWriteChanForRegion(999, peer); got != queue {
+		t.Fatal("approved reverse route discarded because remote home is filtered")
+	}
+	delete(c.derpMap.Regions, 17)
+	if got := c.derpWriteChanForRegion(999, peer); got != nil {
+		t.Fatal("reverse route escaped the filtered map")
+	}
+}
+
+func TestLegacyFilteredMapUsesWarmApprovedRendezvous(t *testing.T) {
+	old := HookFallbackDERPRegions.Load()
+	t.Cleanup(func() { HookFallbackDERPRegions.Store(old) })
+	HookFallbackDERPRegions.Store(func() []int { return []int{17} })
+	peer := key.NewNode().Public()
+	queue := make(chan derpWriteRequest, 1)
+	now := time.Now()
+	c := &Conn{
+		privateKey:   key.NewNode(),
+		derpMap:      &tailcfg.DERPMap{Regions: map[int]*tailcfg.DERPRegion{17: {RegionID: 17}}},
+		activeDerp:   map[int]activeDerp{17: {writeCh: queue, lastWrite: &now}},
+		peerLastDerp: make(map[key.NodePublic]int),
+		logf:         t.Logf,
+	}
+	if sent, err := c.sendAddr(peerDERPAddress(999), peer, []byte("first packet"), false, false); !sent || err != nil {
+		t.Fatalf("approved initial send: %v %v", sent, err)
+	}
+	if len(queue) != 1 || !c.requiredPeerDERPs()[17] || c.permitsPeerDERP(peer, 999) {
+		t.Fatal("filtered rendezvous was not retained or unauthorized region allowed")
+	}
+	if !c.permitsNativePeer(peer, false) {
+		t.Fatal("legacy rendezvous hook changed native policy")
+	}
+	HookFallbackDERPRegions.Store(func() []int { return nil })
+	if _, allowed := c.selectPeerDERP(peer, 999); allowed {
+		t.Fatal("empty approved map failed open")
+	}
+	HookFallbackDERPRegions.Store(nil)
+	if region, allowed := c.selectPeerDERP(peer, 999); !allowed || region != 999 {
+		t.Fatal("unconfigured upstream behavior changed")
+	}
+}
