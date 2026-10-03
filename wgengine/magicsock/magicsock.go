@@ -367,6 +367,8 @@ type Conn struct {
 	peersByID          map[tailcfg.NodeID]tailcfg.NodeView // current peer set, keyed by NodeID. Maintained by SetNetworkMap/UpsertPeer/RemovePeer. Note: per-field NodeMutation patches received in UpdateNetmapDelta are never applied to these snapshots.
 	transportPeers     sync.Map                            // node key -> control-authenticated NodeView; lock-free policy lookups
 	transportDiscoKeys sync.Map                            // node key -> current authenticated disco key, including TSMP rotations
+	transportPeerKeys  sync.Map                            // stable node ID -> current authenticated node key
+	transportEndpoints sync.Map                            // node key -> immutable authenticated endpoint slice, including deltas
 
 	filt               *filter.Filter     // from last SetFilter
 	relayClientEnabled bool               // whether we can allocate UDP relay endpoints on UDP relay servers or receive CallMeMaybeVia messages from peers
@@ -1090,7 +1092,10 @@ func (c *Conn) updateNetInfo(ctx context.Context) (*netcheck.Report, error) {
 	c.lastNetCheckReport.Store(report)
 	c.noV4.Store(!report.IPv4)
 	c.noV6.Store(!report.IPv6)
-	c.noV4Send.Store(!report.IPv4CanSend)
+	// No eligible STUN probe, a filtered authority, or an explicit embedding
+	// denial is not evidence of a failed local socket. Rebind only on a real
+	// attempted write failure, and let successful sends override such failures.
+	c.noV4Send.Store(report.IPv4SendError && !report.IPv4CanSend)
 
 	ni := &tailcfg.NetInfo{
 		DERPLatency:           map[string]float64{},
@@ -1711,6 +1716,9 @@ func (c *Conn) sendUDPStd(addr netip.AddrPort, b []byte) (sent bool, err error) 
 // returns (false, nil); it's not an error, but nothing was sent.
 func (c *Conn) sendAddr(addr netip.AddrPort, pubKey key.NodePublic, b []byte, isDisco bool, isGeneveEncap bool) (sent bool, err error) {
 	if addr.Addr() != tailcfg.DerpMagicIPAddr {
+		if policy, scoped := c.transportPolicy(pubKey); scoped && policy.ProxyUDP && !isGeneveEncap {
+			return c.sendProxyDatagram(pubKey, addr, b)
+		}
 		if !c.permitsNativePeer(pubKey, isGeneveEncap) {
 			c.observePeerTransport(pubKey, "native_udp", 0, "blocked_send", len(b))
 			return false, nil
@@ -1971,8 +1979,13 @@ func (c *Conn) receiveIP(b []byte, ipp netip.AddrPort, cache *epAddrEndpointCach
 		return nil, 0, false, false
 	}
 	now := mono.Now()
-	ep.lastRecvUDPAny.StoreAtomic(now)
-	connNoted := ep.noteRecvActivity(src, now)
+	connNoted := false
+	if HookPeerTransportPolicy.Load() == nil {
+		ep.lastRecvUDPAny.StoreAtomic(now)
+		connNoted = ep.noteRecvActivity(src, now)
+	}
+	// Scoped transport updates liveness only through FromPeer, after both
+	// WireGuard identity authentication and replay validation.
 	if buildfeatures.HasNetLog {
 		if update := c.connCounter.Load(); update != nil {
 			update(0, netip.AddrPortFrom(ep.nodeAddr, 0), ipp, 1, geneveInclusivePacketLen, true)
@@ -1987,7 +2000,7 @@ func (c *Conn) receiveIP(b []byte, ipp netip.AddrPort, cache *epAddrEndpointCach
 		return &lazyEndpoint{c: c, maybeEP: ep, src: src}, size, isGeneveEncap, true
 	}
 	if HookPeerTransportPolicy.Load() != nil {
-		return &transportAuthorizedEndpoint{endpoint: ep, packetBytes: size}, size, isGeneveEncap, true
+		return &transportAuthorizedEndpoint{endpoint: ep, source: src.ap, packetBytes: size}, size, isGeneveEncap, true
 	}
 	return ep, size, isGeneveEncap, true
 }
@@ -2040,7 +2053,15 @@ func (c *Conn) sendDiscoAllocateUDPRelayEndpointRequest(dst epAddr, dstKey key.N
 // unambiguously maps to exactly one peer.
 func (c *Conn) sendDiscoMessage(dst epAddr, dstKey key.NodePublic, dstDisco key.DiscoPublic, m disco.Message, logLevel discoLogLevel) (sent bool, err error) {
 	isDERP := dst.ap.Addr() == tailcfg.DerpMagicIPAddr
-	if !isDERP && !c.permitsNativeDisco(dstDisco, dst.vni.IsSet()) {
+	var proxyPeer key.NodePublic
+	useProxy := false
+	if !isDERP && !dst.vni.IsSet() && HookPeerDatagramTransport.Load() != nil && HookPeerTransportPolicy.Load() != nil {
+		var unique bool
+		proxyPeer, unique = c.proxyDiscoPeer(dstDisco, dstKey)
+		proxyPolicy, scoped := c.transportPolicy(proxyPeer)
+		useProxy = unique && scoped && proxyPolicy.ProxyUDP
+	}
+	if !isDERP && !useProxy && !c.permitsNativeDisco(dstDisco, dst.vni.IsSet()) {
 		return false, nil
 	}
 	if _, isPong := m.(*disco.Pong); isPong && !isDERP && dst.ap.Addr().Is4() {
@@ -2108,6 +2129,9 @@ func (c *Conn) sendDiscoMessage(dst epAddr, dstKey key.NodePublic, dstDisco key.
 	// Native disco may have an ambiguous/zero node key. It has already been
 	// checked against every matching authenticated peer above.
 	if !isDERP && dstKey.IsZero() && HookPeerTransportPolicy.Load() != nil {
+		if useProxy {
+			return c.sendProxyDatagram(proxyPeer, dst.ap, pkt)
+		}
 		return c.sendUDP(dst.ap, pkt, true, dst.vni.IsSet())
 	}
 	sent, err = c.sendAddr(dst.ap, dstKey, pkt, isDisco, dst.vni.IsSet())
@@ -2158,6 +2182,7 @@ const (
 	discoRXPathUDP       discoRXPath = "UDP socket"
 	discoRXPathDERP      discoRXPath = "DERP"
 	discoRXPathRawSocket discoRXPath = "raw socket"
+	discoRXPathProxy     discoRXPath = "approved proxy datagram"
 )
 
 const discoHeaderLen = len(disco.Magic) + key.DiscoPublicRawLen
@@ -2272,7 +2297,13 @@ func packetLooksLike(msg []byte) (t packetLooksLikeType, isGeneveEncap bool) {
 // by a Geneve header with the control bit set.
 func (c *Conn) handleDiscoMessage(msg []byte, src epAddr, shouldBeRelayHandshakeMsg bool, derpNodeSrc key.NodePublic, via discoRXPath) {
 	sender := key.DiscoPublicFromRaw32(mem.B(msg[len(disco.Magic):discoHeaderLen]))
-	if src.ap.Addr() != tailcfg.DerpMagicIPAddr && !c.permitsNativeDisco(sender, src.vni.IsSet()) {
+	if via == discoRXPathProxy {
+		policy, scoped := c.transportPolicy(derpNodeSrc)
+		discoKey, known := c.transportDiscoKeys.Load(derpNodeSrc)
+		if !scoped || !policy.ProxyUDP || !known || discoKey.(key.DiscoPublic) != sender || src.vni.IsSet() {
+			return
+		}
+	} else if src.ap.Addr() != tailcfg.DerpMagicIPAddr && !c.permitsNativeDisco(sender, src.vni.IsSet()) {
 		return
 	}
 
@@ -2367,8 +2398,12 @@ func (c *Conn) handleDiscoMessage(msg []byte, src epAddr, shouldBeRelayHandshake
 
 	if isDERP {
 		metricRecvDiscoDERP.Add(1)
+		c.observePeerTransport(derpNodeSrc, "derp_discovery", int(src.ap.Port()), "received", len(msg))
 	} else {
 		metricRecvDiscoUDP.Add(1)
+		if via == discoRXPathProxy {
+			c.observePeerTransport(derpNodeSrc, "proxy_discovery", 0, "received", len(msg))
+		}
 	}
 
 	if shouldBeRelayHandshakeMsg {
@@ -2388,20 +2423,27 @@ func (c *Conn) handleDiscoMessage(msg []byte, src epAddr, shouldBeRelayHandshake
 	switch dm := dm.(type) {
 	case *disco.Ping:
 		metricRecvDiscoPing.Add(1)
-		c.handlePingLocked(dm, src, di, derpNodeSrc)
+		c.handlePingLocked(dm, src, di, derpNodeSrc, via == discoRXPathProxy)
 	case *disco.Pong:
 		metricRecvDiscoPong.Add(1)
 		// There might be multiple nodes for the sender's DiscoKey.
 		// Ask each to handle it, stopping once one reports that
 		// the Pong's TxID was theirs.
 		knownTxID := false
-		c.peerMap.forEachEndpointWithDiscoKey(sender, func(ep *endpoint) (keepGoing bool) {
+		handle := func(ep *endpoint) (keepGoing bool) {
 			if ep.handlePongConnLocked(dm, di, src) {
 				knownTxID = true
 				return false
 			}
 			return true
-		})
+		}
+		if via == discoRXPathProxy {
+			if ep, ok := c.peerMap.endpointForNodeKey(derpNodeSrc); ok {
+				handle(ep)
+			}
+		} else {
+			c.peerMap.forEachEndpointWithDiscoKey(sender, handle)
+		}
 		if !knownTxID && src.vni.IsSet() {
 			// If it's an unknown TxID, and it's Geneve-encapsulated, then
 			// make [relayManager] aware. It might be in the middle of probing
@@ -2619,7 +2661,7 @@ func (c *Conn) unambiguousNodeKeyOfPingLocked(dm *disco.Ping, dk key.DiscoPublic
 
 // di is the discoInfo of the source of the ping.
 // derpNodeSrc is non-zero if the ping arrived via DERP.
-func (c *Conn) handlePingLocked(dm *disco.Ping, src epAddr, di *discoInfo, derpNodeSrc key.NodePublic) {
+func (c *Conn) handlePingLocked(dm *disco.Ping, src epAddr, di *discoInfo, derpNodeSrc key.NodePublic, proxyBound bool) {
 	likelyHeartBeat := src == di.lastPingFrom && time.Since(di.lastPingTime) < 5*time.Second
 	di.lastPingFrom = src
 	di.lastPingTime = time.Now()
@@ -2671,9 +2713,12 @@ func (c *Conn) handlePingLocked(dm *disco.Ping, src epAddr, di *discoInfo, derpN
 
 	// Remember this route if not present.
 	var dup bool
-	if isDerp {
-		if _, ok := c.peerMap.endpointForNodeKey(derpNodeSrc); ok {
+	if isDerp || proxyBound {
+		if ep, ok := c.peerMap.endpointForNodeKey(derpNodeSrc); ok {
 			numNodes = 1
+			if proxyBound && ep.addCandidateEndpoint(src.ap, dm.TxID) {
+				return
+			}
 		}
 	} else {
 		c.peerMap.forEachEndpointWithDiscoKey(di.discoKey, func(ep *endpoint) (keepGoing bool) {
@@ -3228,6 +3273,8 @@ func (c *Conn) updateNodes(self tailcfg.NodeView, peers []tailcfg.NodeView) (pee
 	// rotated their node key.
 	for id, prev := range c.peersByID {
 		if n, ok := newPeers[id]; !ok || n.Key() != prev.Key() {
+			c.transportPeerKeys.CompareAndDelete(prev.StableID(), prev.Key())
+			c.transportEndpoints.Delete(prev.Key())
 			c.transportPeers.Delete(prev.Key())
 			c.transportDiscoKeys.Delete(prev.Key())
 			delete(c.derpRoute, prev.Key())
@@ -3281,6 +3328,8 @@ func (c *Conn) upsertPeerLocked(n tailcfg.NodeView, flags debugFlags, entriesPer
 		return
 	}
 	c.transportPeers.Store(n.Key(), n)
+	c.transportPeerKeys.Store(n.StableID(), n.Key())
+	c.transportEndpoints.Store(n.Key(), append([]netip.AddrPort(nil), n.Endpoints().AsSlice()...))
 	ep, ok := c.peerMap.endpointForNodeID(n.ID())
 	if ok && ep.publicKey != n.Key() {
 		// The node rotated public keys. Delete the old endpoint and create
@@ -3396,6 +3445,8 @@ func (c *Conn) UpsertPeer(n tailcfg.NodeView) {
 	}
 	flags := c.debugFlagsLocked()
 	if prev, ok := c.peersByID[n.ID()]; ok && prev.Key() != n.Key() {
+		c.transportPeerKeys.CompareAndDelete(prev.StableID(), prev.Key())
+		c.transportEndpoints.Delete(prev.Key())
 		c.transportPeers.Delete(prev.Key())
 		c.transportDiscoKeys.Delete(prev.Key())
 		delete(c.derpRoute, prev.Key())
@@ -3445,6 +3496,8 @@ func (c *Conn) RemovePeer(nid tailcfg.NodeID) {
 		return
 	}
 	delete(c.peersByID, nid)
+	c.transportPeerKeys.CompareAndDelete(prev.StableID(), prev.Key())
+	c.transportEndpoints.Delete(prev.Key())
 	c.transportPeers.Delete(prev.Key())
 	c.transportDiscoKeys.Delete(prev.Key())
 	delete(c.derpRoute, prev.Key())
@@ -3549,8 +3602,9 @@ func (c *Conn) Bind() conn.Bind {
 // The subsequent Close is a real close.
 type connBind struct {
 	*Conn
-	mu     sync.Mutex
-	closed bool
+	mu        sync.Mutex
+	closed    bool
+	proxyDone chan struct{}
 }
 
 // This is a compile-time assertion that connBind implements the wireguard-go
@@ -3587,6 +3641,10 @@ func (c *connBind) Open(ignoredPort uint16) ([]conn.ReceiveFunc, uint16, error) 
 	if runtime.GOOS == "js" {
 		fns = []conn.ReceiveFunc{c.receiveDERP}
 	}
+	if HookPeerDatagramTransport.Load() != nil {
+		c.proxyDone = make(chan struct{})
+		fns = append(fns, c.receiveProxyDatagram(c.proxyDone))
+	}
 	// TODO: Combine receiveIPv4 and receiveIPv6 and receiveIP into a single
 	// closure that closes over a *RebindingUDPConn?
 	return fns, c.LocalPort(), nil
@@ -3610,6 +3668,10 @@ func (c *connBind) Close() error {
 		return nil
 	}
 	c.closed = true
+	if c.proxyDone != nil {
+		close(c.proxyDone)
+		c.proxyDone = nil
+	}
 	// Unblock all outstanding receives.
 	c.pconn4.Close()
 	c.pconn6.Close()
@@ -4035,6 +4097,7 @@ func (c *Conn) UpdateNetmapDelta(muts []netmap.NodeMutation) {
 		case netmap.NodeMutationDERPHome:
 			ep.setDERPHome(uint16(m.DERPRegion))
 		case netmap.NodeMutationEndpoints:
+			c.transportEndpoints.Store(ep.publicKey, append([]netip.AddrPort(nil), m.Endpoints...))
 			ep.mu.Lock()
 			ep.setEndpointsLocked(views.SliceOf(m.Endpoints))
 			ep.mu.Unlock()

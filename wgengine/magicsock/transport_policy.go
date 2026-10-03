@@ -14,6 +14,7 @@ import (
 // data to the same region set; it also constrains reverse-route reuse.
 type PeerTransportPolicy struct {
 	NativeUDP   bool
+	ProxyUDP    bool
 	DERPRegions []int
 }
 
