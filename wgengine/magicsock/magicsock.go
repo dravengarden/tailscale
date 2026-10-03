@@ -1716,6 +1716,10 @@ func (c *Conn) sendUDPStd(addr netip.AddrPort, b []byte) (sent bool, err error) 
 // returns (false, nil); it's not an error, but nothing was sent.
 func (c *Conn) sendAddr(addr netip.AddrPort, pubKey key.NodePublic, b []byte, isDisco bool, isGeneveEncap bool) (sent bool, err error) {
 	if addr.Addr() != tailcfg.DerpMagicIPAddr {
+		if !c.permitsPeerAddress(pubKey, addr) {
+			c.observePeerTransport(pubKey, "native_udp", 0, "skipped_address_family", 0)
+			return false, nil
+		}
 		if policy, scoped := c.transportPolicy(pubKey); scoped && policy.ProxyUDP && !isGeneveEncap {
 			return c.sendProxyDatagram(pubKey, addr, b)
 		}
@@ -1974,7 +1978,7 @@ func (c *Conn) receiveIP(b []byte, ipp netip.AddrPort, cache *epAddrEndpointCach
 		cache.gen = de.numStopAndReset()
 		ep = de
 	}
-	if !c.permitsNativePeer(ep.publicKey, src.vni.IsSet()) {
+	if !c.permitsNativePeer(ep.publicKey, src.vni.IsSet()) || !c.permitsPeerAddress(ep.publicKey, src.ap) {
 		c.observePeerTransport(ep.publicKey, "native_udp", 0, "blocked_receive", size)
 		return nil, 0, false, false
 	}
@@ -2053,6 +2057,15 @@ func (c *Conn) sendDiscoAllocateUDPRelayEndpointRequest(dst epAddr, dstKey key.N
 // unambiguously maps to exactly one peer.
 func (c *Conn) sendDiscoMessage(dst epAddr, dstKey key.NodePublic, dstDisco key.DiscoPublic, m disco.Message, logLevel discoLogLevel) (sent bool, err error) {
 	isDERP := dst.ap.Addr() == tailcfg.DerpMagicIPAddr
+	if !isDERP {
+		allowed := c.permitsDiscoAddress(dstDisco, dst.ap)
+		if !dstKey.IsZero() {
+			allowed = c.permitsPeerAddress(dstKey, dst.ap)
+		}
+		if !allowed {
+			return false, nil
+		}
+	}
 	var proxyPeer key.NodePublic
 	useProxy := false
 	if !isDERP && !dst.vni.IsSet() && HookPeerDatagramTransport.Load() != nil && HookPeerTransportPolicy.Load() != nil {
@@ -2300,10 +2313,10 @@ func (c *Conn) handleDiscoMessage(msg []byte, src epAddr, shouldBeRelayHandshake
 	if via == discoRXPathProxy {
 		policy, scoped := c.transportPolicy(derpNodeSrc)
 		discoKey, known := c.transportDiscoKeys.Load(derpNodeSrc)
-		if !scoped || !policy.ProxyUDP || !known || discoKey.(key.DiscoPublic) != sender || src.vni.IsSet() {
+		if !scoped || !policy.ProxyUDP || !known || discoKey.(key.DiscoPublic) != sender || src.vni.IsSet() || !c.permitsPeerAddress(derpNodeSrc, src.ap) {
 			return
 		}
-	} else if src.ap.Addr() != tailcfg.DerpMagicIPAddr && !c.permitsNativeDisco(sender, src.vni.IsSet()) {
+	} else if src.ap.Addr() != tailcfg.DerpMagicIPAddr && (!c.permitsNativeDisco(sender, src.vni.IsSet()) || !c.permitsDiscoAddress(sender, src.ap)) {
 		return
 	}
 

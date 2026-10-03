@@ -80,6 +80,10 @@ func (c *Conn) sendProxyDatagram(peer key.NodePublic, destination netip.AddrPort
 	if !scoped || !p.ProxyUDP || transport == nil {
 		return false, errProxyDatagramUnavailable
 	}
+	if !c.permitsPeerAddress(peer, destination) {
+		c.observePeerTransport(peer, path, 0, "skipped_address_family", 0)
+		return false, errProxyDatagramUnavailable
+	}
 	node, ok := c.transportPeers.Load(peer)
 	if !ok {
 		return false, errProxyDatagramUnavailable
@@ -123,6 +127,10 @@ func (c *Conn) receiveProxyDatagram(done <-chan struct{}) conn.ReceiveFunc {
 			peer, ok := c.proxyPeerKey(packet.Peer)
 			policy, scoped := c.transportPolicy(peer)
 			if !ok || !scoped || !policy.ProxyUDP {
+				continue
+			}
+			if !c.permitsPeerAddress(peer, packet.Source) {
+				c.observePeerTransport(peer, "proxy_udp", 0, "blocked_receive", len(packet.Data))
 				continue
 			}
 			if len(packet.Data) < 4 || len(packet.Data) > len(packets[0]) {
