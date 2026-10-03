@@ -26,6 +26,14 @@ policies here. Those remain Stormbird-owned runtime configuration. Remove the
 replacement when an upstream release includes equivalent behavior and passes
 the consumer's negative socket and approved-proxy regressions.
 
+The optional per-peer `UnderlayAddressFamily` restricts authenticated outer
+UDP candidates before discovery timers, native or proxy socket writes, path
+promotion, and receive authorization. Its zero value preserves dual stack.
+It does not constrain inner WireGuard address families, shared DERP sockets,
+or public application traffic. Stormbird owns all policy values. Remove this
+boundary when equivalent upstream per-peer enforcement passes the consumer's
+family, domestic IPv6, proxy authorization and fail-closed regressions.
+
 Validation from the pinned Stormbird development shell:
 
 The optional `derphttp.HookDialPolicy` authorizes DERP independently of control

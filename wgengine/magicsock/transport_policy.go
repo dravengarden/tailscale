@@ -13,9 +13,56 @@ import (
 // discovery, not just WireGuard data. DERPRegions confines both discovery and
 // data to the same region set; it also constrains reverse-route reuse.
 type PeerTransportPolicy struct {
-	NativeUDP   bool
-	ProxyUDP    bool
-	DERPRegions []int
+	NativeUDP             bool
+	ProxyUDP              bool
+	DERPRegions           []int
+	UnderlayAddressFamily PeerUnderlayAddressFamily
+}
+
+// PeerUnderlayAddressFamily restricts only a peer's outer UDP endpoints.
+// It does not restrict WireGuard's inner addresses or shared DERP sockets.
+// The zero value preserves the legacy dual-stack behavior.
+type PeerUnderlayAddressFamily uint8
+
+const (
+	PeerUnderlayDualStack PeerUnderlayAddressFamily = iota
+	PeerUnderlayIPv4Only
+	PeerUnderlayIPv6Only
+)
+
+func (c *Conn) permitsPeerAddress(peer key.NodePublic, address netip.AddrPort) bool {
+	p, scoped := c.transportPolicy(peer)
+	if !scoped || p.UnderlayAddressFamily == PeerUnderlayDualStack {
+		return true
+	}
+	if !address.IsValid() {
+		return false
+	}
+	switch p.UnderlayAddressFamily {
+	case PeerUnderlayDualStack:
+		return true
+	case PeerUnderlayIPv4Only:
+		return address.Addr().Unmap().Is4()
+	case PeerUnderlayIPv6Only:
+		return address.Addr().Unmap().Is6()
+	default:
+		return false
+	}
+}
+
+func (c *Conn) permitsDiscoAddress(disco key.DiscoPublic, address netip.AddrPort) bool {
+	if HookPeerTransportPolicy.Load() == nil {
+		return true
+	}
+	found, allowed := false, true
+	c.transportDiscoKeys.Range(func(k, value any) bool {
+		if value.(key.DiscoPublic) == disco {
+			found = true
+			allowed = allowed && c.permitsPeerAddress(k.(key.NodePublic), address)
+		}
+		return allowed
+	})
+	return found && allowed
 }
 
 // HookPeerTransportPolicy returns the embedding application's explicit policy

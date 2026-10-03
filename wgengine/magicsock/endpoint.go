@@ -1008,7 +1008,7 @@ func (de *endpoint) discoPing(res *ipnstate.PingResult, size int, cb func(*ipnst
 
 	now := mono.Now()
 	udpAddr, derpAddr := de.addrForPingSizeLocked(now, size)
-	if !de.c.permitsPeerUDP(de.publicKey, udpAddr.vni.IsSet()) {
+	if !de.c.permitsPeerUDP(de.publicKey, udpAddr.vni.IsSet()) || !de.c.permitsPeerAddress(de.publicKey, udpAddr.ap) {
 		udpAddr = epAddr{}
 	}
 	if _, scoped := de.c.transportPolicy(de.publicKey); scoped && !derpAddr.IsValid() && !udpAddr.ap.IsValid() {
@@ -1069,7 +1069,7 @@ func (de *endpoint) send(buffs [][]byte, offset int) error {
 
 	now := mono.Now()
 	udpAddr, derpAddr, startWGPing := de.addrForSendLocked(now)
-	if !de.c.permitsPeerUDP(de.publicKey, udpAddr.vni.IsSet()) {
+	if !de.c.permitsPeerUDP(de.publicKey, udpAddr.vni.IsSet()) || !de.c.permitsPeerAddress(de.publicKey, udpAddr.ap) {
 		udpAddr = epAddr{}
 		startWGPing = false
 	}
@@ -1365,6 +1365,9 @@ func (de *endpoint) startDiscoPingLocked(ep epAddr, now mono.Time, purpose disco
 		ep.ap = peerDERPAddress(region)
 	} else if !de.c.permitsPeerUDP(de.publicKey, ep.vni.IsSet()) {
 		return
+	} else if !de.c.permitsPeerAddress(de.publicKey, ep.ap) {
+		de.c.observePeerTransport(de.publicKey, "discovery", 0, "skipped_address_family", 0)
+		return
 	}
 	if debugNeverDirectUDP() && !ep.vni.IsSet() && ep.ap.Addr() != tailcfg.DerpMagicIPAddr {
 		return
@@ -1645,6 +1648,9 @@ func (de *endpoint) setEndpointsLocked(eps interface {
 			de.c.logf("magicsock: bogus netmap endpoint from %v", eps)
 			continue
 		}
+		if !de.c.permitsPeerAddress(de.publicKey, ipp) {
+			continue
+		}
 		if st, ok := de.endpointState[ipp]; ok {
 			st.index = int16(i)
 		} else {
@@ -1663,7 +1669,7 @@ func (de *endpoint) setEndpointsLocked(eps interface {
 	// Now delete anything unless it's still in the network map or
 	// was a recently discovered endpoint.
 	for ep, st := range de.endpointState {
-		if st.shouldDeleteLocked() {
+		if st.shouldDeleteLocked() || !de.c.permitsPeerAddress(de.publicKey, ep) {
 			de.deleteEndpointLocked("updateFromNode", ep)
 		}
 	}
@@ -1677,6 +1683,9 @@ func (de *endpoint) setEndpointsLocked(eps interface {
 // This is called once we've already verified that we got a valid
 // discovery message from de via ep.
 func (de *endpoint) addCandidateEndpoint(ep netip.AddrPort, forRxPingTxID stun.TxID) (duplicatePing bool) {
+	if !de.c.permitsPeerAddress(de.publicKey, ep) {
+		return false
+	}
 	de.mu.Lock()
 	defer de.mu.Unlock()
 
@@ -1800,6 +1809,9 @@ func (de *endpoint) handlePongConnLocked(m *disco.Pong, di *discoInfo, src epAdd
 	defer de.mu.Unlock()
 
 	isDerp := src.ap.Addr() == tailcfg.DerpMagicIPAddr
+	if !isDerp && !de.c.permitsPeerAddress(de.publicKey, src.ap) {
+		return false
+	}
 
 	sp, ok := de.sentPing[m.TxID]
 	if !ok {
@@ -2036,6 +2048,9 @@ func (de *endpoint) handleCallMeMaybe(m *disco.CallMeMaybe) {
 			// We send these out, but ignore them for now.
 			// TODO: teach the ping code to ping on all interfaces
 			// for these.
+			continue
+		}
+		if !de.c.permitsPeerAddress(de.publicKey, ep) {
 			continue
 		}
 		mak.Set(&de.isCallMeMaybeEP, ep, true)

@@ -42,6 +42,9 @@ func (ep *transportAuthorizedEndpoint) AuthorizePeer(raw [32]byte) bool {
 		policy, scoped := ep.c.transportPolicy(peer)
 		allowed = scoped && policy.ProxyUDP
 	}
+	if ep.region == 0 {
+		allowed = allowed && ep.c.permitsPeerAddress(peer, ep.source)
+	}
 	action := "blocked_receive"
 	if allowed {
 		action = "received"
@@ -59,6 +62,9 @@ var _ conn.PeerAwareEndpoint = (*transportAuthorizedEndpoint)(nil)
 func (ep *transportAuthorizedEndpoint) FromPeer(raw [32]byte) {
 	peer := key.NodePublicFromRaw32(mem.B(raw[:]))
 	if peer != ep.publicKey || ep.region != 0 || !ep.source.IsValid() {
+		return
+	}
+	if !ep.c.permitsPeerAddress(peer, ep.source) {
 		return
 	}
 	if ep.proxy {
