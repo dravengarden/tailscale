@@ -86,16 +86,21 @@ const (
 	defaultInitialRetransmitTime = 100 * time.Millisecond
 )
 
+// ErrPacketPolicyDenied is an embedding policy decision, not a broken socket.
+// It must never be interpreted as evidence that rebinding can repair UDP.
+var ErrPacketPolicyDenied = errors.New("overlay native packet denied by policy")
+
 // Report contains the result of a single netcheck.
 type Report struct {
-	Now         time.Time // the time the report was run
-	UDP         bool      // a UDP STUN round trip completed
-	IPv6        bool      // an IPv6 STUN round trip completed
-	IPv4        bool      // an IPv4 STUN round trip completed
-	IPv6CanSend bool      // an IPv6 packet was able to be sent
-	IPv4CanSend bool      // an IPv4 packet was able to be sent
-	OSHasIPv6   bool      // could bind a socket to ::1
-	ICMPv4      bool      // an ICMPv4 round trip completed
+	Now           time.Time // the time the report was run
+	UDP           bool      // a UDP STUN round trip completed
+	IPv6          bool      // an IPv6 STUN round trip completed
+	IPv4          bool      // an IPv4 STUN round trip completed
+	IPv6CanSend   bool      // an IPv6 packet was able to be sent
+	IPv4CanSend   bool      // an IPv4 packet was able to be sent
+	IPv4SendError bool      // an actual attempted IPv4 write failed outside policy
+	OSHasIPv6     bool      // could bind a socket to ::1
+	ICMPv4        bool      // an ICMPv4 round trip completed
 
 	// MappingVariesByDestIP is whether STUN results depend which
 	// STUN server you're talking to (on IPv4).
@@ -1618,6 +1623,10 @@ func (rs *reportState) runProbe(ctx context.Context, dm *tailcfg.DERPMap, probe 
 		case probeIPv6:
 			rs.report.IPv6CanSend = true
 		}
+		rs.mu.Unlock()
+	} else if probe.proto == probeIPv4 && !errors.Is(err, ErrPacketPolicyDenied) {
+		rs.mu.Lock()
+		rs.report.IPv4SendError = true
 		rs.mu.Unlock()
 	}
 

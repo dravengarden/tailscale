@@ -1008,7 +1008,7 @@ func (de *endpoint) discoPing(res *ipnstate.PingResult, size int, cb func(*ipnst
 
 	now := mono.Now()
 	udpAddr, derpAddr := de.addrForPingSizeLocked(now, size)
-	if !de.c.permitsNativePeer(de.publicKey, udpAddr.vni.IsSet()) {
+	if !de.c.permitsPeerUDP(de.publicKey, udpAddr.vni.IsSet()) {
 		udpAddr = epAddr{}
 	}
 	if _, scoped := de.c.transportPolicy(de.publicKey); scoped && !derpAddr.IsValid() && !udpAddr.ap.IsValid() {
@@ -1069,7 +1069,7 @@ func (de *endpoint) send(buffs [][]byte, offset int) error {
 
 	now := mono.Now()
 	udpAddr, derpAddr, startWGPing := de.addrForSendLocked(now)
-	if !de.c.permitsNativePeer(de.publicKey, udpAddr.vni.IsSet()) {
+	if !de.c.permitsPeerUDP(de.publicKey, udpAddr.vni.IsSet()) {
 		udpAddr = epAddr{}
 		startWGPing = false
 	}
@@ -1091,6 +1091,9 @@ func (de *endpoint) send(buffs [][]byte, offset int) error {
 	}
 	de.noteTxActivityExtTriggerLocked(now)
 	de.lastSendAny = now
+	if debugDisco() && derpAddr.IsValid() {
+		de.c.logf("magicsock: peer data fallback: best_valid=%v heartbeat_disabled=%v pong_age=%v trust_remaining=%v batch=%v", udpAddr.ap.IsValid(), de.heartbeatDisabled, now.Sub(de.bestAddrAt), de.trustBestAddrUntil.Sub(now), len(buffs))
+	}
 	de.mu.Unlock()
 
 	if !udpAddr.ap.IsValid() && !derpAddr.IsValid() {
@@ -1106,8 +1109,17 @@ func (de *endpoint) send(buffs [][]byte, offset int) error {
 	}
 	var err error
 	if udpAddr.ap.IsValid() {
-		_, err = de.c.sendUDPBatch(udpAddr, buffs, offset)
-		if err == nil {
+		policy, _ := de.c.transportPolicy(de.publicKey)
+		if policy.ProxyUDP {
+			for _, b := range buffs {
+				if _, err = de.c.sendProxyDatagram(de.publicKey, udpAddr.ap, b[offset:]); err != nil {
+					break
+				}
+			}
+		} else {
+			_, err = de.c.sendUDPBatch(udpAddr, buffs, offset)
+		}
+		if err == nil && !policy.ProxyUDP {
 			for _, b := range buffs {
 				de.c.observePeerTransport(de.publicKey, "native_udp", 0, "sent", len(b)-offset)
 			}
@@ -1217,6 +1229,26 @@ func (de *endpoint) discoPingTimeout(txid stun.TxID) {
 		return
 	}
 	bestUntrusted := mono.Now().After(de.trustBestAddrUntil)
+	// PMTUD replaces initial discovery with nonzero-sized pings. Only its
+	// smallest baseline probe represents reachability: a larger probe may
+	// legitimately fail on an otherwise healthy path.
+	baselineProbe := sp.size == 0
+	if sp.purpose == pingDiscovery || sp.purpose == pingCLI {
+		sizes := mtuProbePingSizesV4
+		if sp.to.ap.Addr().Is6() {
+			sizes = mtuProbePingSizesV6
+		}
+		baselineProbe = baselineProbe || sp.size == slices.Min(sizes)
+	}
+	if bestUntrusted && baselineProbe && sp.to.ap.Addr() != tailcfg.DerpMagicIPAddr && !sp.to.vni.IsSet() {
+		if policy, scoped := de.c.transportPolicy(de.publicKey); scoped && policy.ProxyUDP {
+			if transport := HookPeerDatagramTransport.Load(); transport != nil {
+				if node, ok := de.c.transportPeers.Load(de.publicKey); ok {
+					go transport.ProbeFailed(node.(tailcfg.NodeView).StableID(), sp.to.ap, sp.at)
+				}
+			}
+		}
+	}
 	if sp.to == de.bestAddr.epAddr && bestUntrusted {
 		de.clearBestAddrLocked()
 	}
@@ -1331,7 +1363,7 @@ func (de *endpoint) startDiscoPingLocked(ep epAddr, now mono.Time, purpose disco
 			return
 		}
 		ep.ap = peerDERPAddress(region)
-	} else if !de.c.permitsNativePeer(de.publicKey, ep.vni.IsSet()) {
+	} else if !de.c.permitsPeerUDP(de.publicKey, ep.vni.IsSet()) {
 		return
 	}
 	if debugNeverDirectUDP() && !ep.vni.IsSet() && ep.ap.Addr() != tailcfg.DerpMagicIPAddr {
@@ -1402,7 +1434,7 @@ func (de *endpoint) sendDiscoPingsLocked(now mono.Time, sendCallMeMaybe bool) {
 		return // skip when direct UDP is disabled
 	}
 	de.lastFullPing = now
-	if !de.c.permitsNativePeer(de.publicKey, false) {
+	if !de.c.permitsPeerUDP(de.publicKey, false) {
 		// Do not mark prohibited endpoints as sent or enqueue CallMeMaybe.
 		// Otherwise every data batch can trigger fresh discovery work because
 		// startDiscoPingLocked correctly leaves their lastPing unchanged.

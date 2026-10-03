@@ -713,13 +713,17 @@ func (c *Conn) runDerpWriter(ctx context.Context, dc *derphttp.Client, regionID 
 		case <-ctx.Done():
 			return
 		case wr := <-ch:
+			path := "derp"
+			if wr.isDisco {
+				path = "derp_discovery"
+			}
 			if !c.permitsPeerDERP(wr.pubKey, regionID) {
-				c.observePeerTransport(wr.pubKey, "derp", regionID, "blocked_send", len(wr.b))
+				c.observePeerTransport(wr.pubKey, path, regionID, "blocked_send", len(wr.b))
 				continue
 			}
 			err := dc.Send(wr.pubKey, wr.b)
 			if err == nil {
-				c.observePeerTransport(wr.pubKey, "derp", regionID, "sent", len(wr.b))
+				c.observePeerTransport(wr.pubKey, path, regionID, "sent", len(wr.b))
 			}
 			if err != nil {
 				c.logf("magicsock: derp.Send(%v): %v", wr.addr, err)
