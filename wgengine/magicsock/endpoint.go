@@ -874,6 +874,7 @@ func (de *endpoint) heartbeat() {
 	if udpAddr.ap.IsValid() {
 		// We have a preferred path. Ping that every 'heartbeatInterval'.
 		de.startDiscoPingLocked(udpAddr, now, pingHeartbeat, 0, nil)
+		de.heartbeatHedgeAddrsLocked(now, udpAddr)
 	}
 
 	if de.wantFullPingLocked(now) {

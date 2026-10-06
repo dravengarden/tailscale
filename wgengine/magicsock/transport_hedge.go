@@ -70,3 +70,19 @@ func (de *endpoint) hedgeAddrsLocked(now mono.Time, primary epAddr, policy PeerT
 	}
 	return result
 }
+
+// heartbeatHedgeAddrsLocked keeps the alternate endpoints of a hedging peer
+// confirmed. A trusted preferred path otherwise suppresses full discovery,
+// which would leave every alternate stale and silently disable hedging.
+// endpoint.mu must be held.
+func (de *endpoint) heartbeatHedgeAddrsLocked(now mono.Time, primary epAddr) {
+	policy, scoped := de.c.transportPolicy(de.publicKey)
+	if !scoped || policy.HedgeCopies < 2 || policy.HedgeBudgetBytesPerSecond == 0 || !policy.NativeUDP || policy.ProxyUDP || !primary.isDirect() {
+		return
+	}
+	for addr := range de.endpointState {
+		if addr != primary.ap && de.c.permitsPeerAddress(de.publicKey, addr) {
+			de.startDiscoPingLocked(epAddr{ap: addr}, now, pingHeartbeat, 0, nil)
+		}
+	}
+}
