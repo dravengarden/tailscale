@@ -106,6 +106,8 @@ type endpoint struct {
 	expired         bool // whether the node has expired
 	isWireguardOnly bool // whether the endpoint is WireGuard only
 	relayCapable    bool // whether the node is capable of speaking via a [tailscale.com/net/udprelay.Server]
+
+	hedge hedgeBudget // duplicate-byte budget for policy hedged sends
 }
 
 // udpRelayEndpointReady determines whether the given relay [addrQuality] should
@@ -1094,6 +1096,14 @@ func (de *endpoint) send(buffs [][]byte, offset int) error {
 	if debugDisco() && derpAddr.IsValid() {
 		de.c.logf("magicsock: peer data fallback: best_valid=%v heartbeat_disabled=%v pong_age=%v trust_remaining=%v batch=%v", udpAddr.ap.IsValid(), de.heartbeatDisabled, now.Sub(de.bestAddrAt), de.trustBestAddrUntil.Sub(now), len(buffs))
 	}
+	var hedges []epAddr
+	if policy, scoped := de.c.transportPolicy(de.publicKey); scoped && udpAddr.isDirect() && now.Before(de.trustBestAddrUntil) {
+		bytes := 0
+		for _, b := range buffs {
+			bytes += len(b) - offset
+		}
+		hedges = de.hedgeAddrsLocked(now, udpAddr, policy, bytes)
+	}
 	de.mu.Unlock()
 
 	if !udpAddr.ap.IsValid() && !derpAddr.IsValid() {
@@ -1118,6 +1128,15 @@ func (de *endpoint) send(buffs [][]byte, offset int) error {
 			}
 		} else {
 			_, err = de.c.sendUDPBatch(udpAddr, buffs, offset)
+			// A hedge copy is best effort: its failure neither fails the send
+			// nor marks the alternate endpoint bad before discovery does.
+			for _, hedge := range hedges {
+				if _, hedgeErr := de.c.sendUDPBatch(hedge, buffs, offset); hedgeErr == nil {
+					for _, b := range buffs {
+						de.c.observePeerTransport(de.publicKey, "native_udp", 0, "hedged", len(b)-offset)
+					}
+				}
+			}
 		}
 		if err == nil && !policy.ProxyUDP {
 			for _, b := range buffs {
