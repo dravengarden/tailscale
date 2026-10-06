@@ -34,6 +34,14 @@ or public application traffic. Stormbird owns all policy values. Remove this
 boundary when equivalent upstream per-peer enforcement passes the consumer's
 family, domestic IPv6, proxy authorization and fail-closed regressions.
 
+The optional per-peer `HedgeCopies` and `HedgeBudgetBytesPerSecond` copy native
+WireGuard data to up to `HedgeCopies-1` alternate direct endpoints of the same
+peer. An alternate must satisfy the peer's transport policy and have answered
+discovery within the trusted-path window; hedging never discovers or authorizes
+a path. A per-endpoint token bucket bounds duplicate bytes and copies are best
+effort. The zero value preserves single-path sends. Stormbird owns all values.
+Remove this when upstream offers equivalent policy-bounded multipath sends.
+
 Validation from the pinned Stormbird development shell:
 
 The optional `derphttp.HookDialPolicy` authorizes DERP independently of control

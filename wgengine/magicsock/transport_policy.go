@@ -17,6 +17,11 @@ type PeerTransportPolicy struct {
 	ProxyUDP              bool
 	DERPRegions           []int
 	UnderlayAddressFamily PeerUnderlayAddressFamily
+	// HedgeCopies, when at least two with a nonzero budget, copies native
+	// WireGuard data to up to HedgeCopies-1 additional pong-confirmed direct
+	// endpoints. The zero value preserves single-path sends.
+	HedgeCopies               uint8
+	HedgeBudgetBytesPerSecond uint32
 }
 
 // PeerUnderlayAddressFamily restricts only a peer's outer UDP endpoints.
