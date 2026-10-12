@@ -21,6 +21,17 @@ failure. Native discovery, transport authorization and fail-closed policy are
 unchanged. Remove this patch when equivalent upstream behavior passes both
 the address-class regression and Stormbird's explicit-rebind transport gate.
 
+A failed `Rebind` is retried with exponential backoff (1 s to 30 s) until
+the IPv4 socket binds or the connection closes. Upstream leaves a
+`blockForeverConn` and waits for a later link change. On macOS, sing-box binds
+magicsock sockets to the current default interface, and a brief Wi-Fi
+`link_off` makes that bind fail with no route. The recovery then produced no
+change that called `Rebind` again, so native UDP stayed down and every peer,
+including LAN peers, used DERP until an unrelated network event (observed
+2026-10-12 on the MacBook Air for more than ten minutes). Remove this patch
+when upstream retries a failed rebind and passes the consumer's flapping-link
+regression.
+
 There are no fleet identities, relay lists, proxy credentials, or routing
 policies here. Those remain Stormbird-owned runtime configuration. Remove the
 replacement when an upstream release includes equivalent behavior and passes
