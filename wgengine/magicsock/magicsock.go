@@ -306,6 +306,14 @@ type Conn struct {
 	// scheduled to fire within derpCleanStaleInterval.
 	derpCleanupTimerArmed bool
 
+	// rebindRetry re-runs a failed Rebind. A failed bind leaves a
+	// blockForeverConn that otherwise waits for a later link change; when
+	// the bind fails during a brief link loss (no default interface yet),
+	// the recovery may produce no change at all and native UDP would stay
+	// down until the next unrelated network event.
+	rebindRetry      *time.Timer
+	rebindRetryDelay time.Duration
+
 	// periodicReSTUNTimer, when non-nil, is an AfterFunc timer
 	// that will call Conn.doPeriodicSTUN.
 	periodicReSTUNTimer *time.Timer
@@ -3732,6 +3740,10 @@ func (c *Conn) Close() error {
 		c.derpCleanupTimer.Stop()
 	}
 	c.stopPeriodicReSTUNTimerLocked()
+	if c.rebindRetry != nil {
+		c.rebindRetry.Stop()
+		c.rebindRetry = nil
+	}
 	if c.portMapper != nil {
 		c.portMapper.Close()
 	}
@@ -4007,8 +4019,10 @@ func (c *Conn) Rebind() {
 	metricRebindCalls.Add(1)
 	if err := c.rebind(keepCurrentPort); err != nil {
 		c.logf("%v", err)
+		c.scheduleRebindRetry()
 		return
 	}
+	c.clearRebindRetry()
 
 	var ifIPs []netip.Prefix
 	if c.netMon != nil {
@@ -4022,6 +4036,60 @@ func (c *Conn) Rebind() {
 		c.maybeCloseDERPsOnRebind(ifIPs)
 	}
 	c.resetEndpointStates()
+}
+
+// Variables so tests can shorten the backoff.
+var (
+	rebindRetryMin = time.Second
+	rebindRetryMax = 30 * time.Second
+)
+
+// scheduleRebindRetry arms one retry of a failed Rebind with exponential
+// backoff. A successful retry asks for fresh endpoints like a link change.
+func (c *Conn) scheduleRebindRetry() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed || c.rebindRetry != nil {
+		return
+	}
+	delay := c.rebindRetryDelay
+	if delay < rebindRetryMin {
+		delay = rebindRetryMin
+	}
+	c.rebindRetryDelay = min(2*delay, rebindRetryMax)
+	c.logf("magicsock: retrying failed rebind in %v", delay)
+	c.rebindRetry = time.AfterFunc(delay, func() {
+		c.mu.Lock()
+		c.rebindRetry = nil
+		closed := c.closed
+		c.mu.Unlock()
+		if closed {
+			return
+		}
+		c.Rebind()
+		if !c.udp4Unbound() {
+			c.ReSTUN("rebind-retry")
+		}
+	})
+}
+
+func (c *Conn) clearRebindRetry() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.rebindRetryDelay = 0
+	if c.rebindRetry != nil {
+		c.rebindRetry.Stop()
+		c.rebindRetry = nil
+	}
+}
+
+// udp4Unbound reports whether the IPv4 socket is the placeholder left by a
+// failed bind.
+func (c *Conn) udp4Unbound() bool {
+	c.pconn4.mu.Lock()
+	defer c.pconn4.mu.Unlock()
+	_, unbound := c.pconn4.pconn.(*blockForeverConn)
+	return unbound
 }
 
 // resetEndpointStates resets the preferred address for all peers.
