@@ -2190,11 +2190,22 @@ func (c *Conn) sendDiscoMessage(dst epAddr, dstKey key.NodePublic, dstDisco key.
 	} else if err == nil {
 		// Can't send. (e.g. no IPv6 locally)
 	} else {
-		if !c.networkDown() && pmtuShouldLogDiscoTxErr(m, err) {
+		if !c.networkDown() && shouldLogDiscoTxErr(m, err) {
 			c.logf("magicsock: disco: failed to send %v to %v %s: %v", disco.MessageSummary(m), dst, dstKey.ShortString(), err)
 		}
 	}
 	return sent, err
+}
+
+// shouldLogDiscoTxErr reports whether a failed disco send is worth a log
+// line. An embedding packet policy denial is a deliberate decision that the
+// embedder already counts, and endpoint heartbeats repeat it for every
+// denied candidate, so it is not logged.
+func shouldLogDiscoTxErr(m disco.Message, err error) bool {
+	if errors.Is(err, netcheck.ErrPacketPolicyDenied) {
+		return false
+	}
+	return pmtuShouldLogDiscoTxErr(m, err)
 }
 
 type discoRXPath string

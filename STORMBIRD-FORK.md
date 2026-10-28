@@ -32,6 +32,13 @@ including LAN peers, used DERP until an unrelated network event (observed
 when upstream retries a failed rebind and passes the consumer's flapping-link
 regression.
 
+A disco send refused with `netcheck.ErrPacketPolicyDenied` is not logged.
+The embedder's packet policy made that decision and counts it, and endpoint
+heartbeats repeat it for every denied candidate: on 2026-10-27 these lines
+were 69% of a cloud node's sing-box log sample and pushed its local evidence
+store to capacity. Other send failures are logged as before. Remove this
+patch with the packet-policy hook.
+
 There are no fleet identities, relay lists, proxy credentials, or routing
 policies here. Those remain Stormbird-owned runtime configuration. Remove the
 replacement when an upstream release includes equivalent behavior and passes
