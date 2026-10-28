@@ -54,11 +54,19 @@ func TestFailedRebindIsRetriedWithoutALinkChange(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	conn.mu.Lock()
-	pending, delay := conn.rebindRetry != nil, conn.rebindRetryDelay
-	conn.mu.Unlock()
-	if pending || delay != 0 {
-		t.Fatalf("retry state not cleared after success: pending=%v delay=%v", pending, delay)
+	// The socket is usable as soon as it binds; Rebind clears the retry
+	// state immediately afterwards, so wait for that step instead of racing it.
+	for {
+		conn.mu.Lock()
+		pending, delay := conn.rebindRetry != nil, conn.rebindRetryDelay
+		conn.mu.Unlock()
+		if !pending && delay == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("retry state not cleared after success: pending=%v delay=%v", pending, delay)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
